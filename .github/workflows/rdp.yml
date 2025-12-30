@@ -16,12 +16,10 @@ jobs:
       run: |
         if (-not $Env:NGROK_AUTH_TOKEN) {
           Write-Host "ERROR: NGROK_AUTH_TOKEN secret is missing."
-          Write-Host "Create a repo secret named 'NGROK_AUTH_TOKEN' with your ngrok token."
           exit 1
         }
         if (-not $Env:RDP_PASSWORD) {
           Write-Host "ERROR: RDP_PASSWORD secret is missing."
-          Write-Host "Create a repo secret named 'RDP_PASSWORD' with the Windows password to set."
           exit 1
         }
         Write-Host "OK: required secrets present."
@@ -47,27 +45,61 @@ jobs:
         Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
 
-    - name: Create or update local user (use secret RDP_PASSWORD)
+    - name: Reset/Create runneradmin & set password (from secret)
       shell: powershell
       env:
         RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       run: |
         if (-not $Env:RDP_PASSWORD) {
-          Write-Host "ERROR: RDP_PASSWORD not provided to this step."
+          Write-Host "ERROR: RDP_PASSWORD missing."
           exit 1
         }
         $pw = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+
         if (-not (Get-LocalUser -Name 'runneradmin' -ErrorAction SilentlyContinue)) {
           New-LocalUser -Name 'runneradmin' -Password $pw -FullName 'runneradmin' -PasswordNeverExpires $true
           Add-LocalGroupMember -Group 'Administrators' -Member 'runneradmin'
+          Write-Host "Created runneradmin and added to Administrators."
         } else {
           Set-LocalUser -Name 'runneradmin' -Password $pw
+          Add-LocalGroupMember -Group 'Administrators' -Member 'runneradmin' -ErrorAction SilentlyContinue
+          Write-Host "Updated runneradmin password and ensured admin membership."
         }
-        Write-Host "Local user 'runneradmin' created/updated."
 
-    - name: Start ngrok TCP tunnel (RDP) — foreground (prints public address)
+        $u = Get-LocalUser -Name 'runneradmin'
+        Write-Host "User exists. Enabled=$($u.Enabled). PasswordExpired=$($u.PasswordExpired)"
+
+    - name: Start ngrok TCP tunnel and print public address (keeps job running)
       shell: powershell
       run: |
-        Write-Host "Starting ngrok (this step will keep running until you cancel the workflow or GitHub stops the runner)."
-        # تشغيل ngrok في الواجهة ليطبع عنوان tcp في سجلات Actions
-        .\ngrok\ngrok.exe tcp 3389 --log=stdout
+        Write-Host "Starting ngrok (will print public address). Cancel the workflow to close the tunnel."
+        Start-Process -FilePath ".\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -NoNewWindow -PassThru | Out-Null
+
+        $timeout = 120
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        $tunnels = $null
+        while ($sw.Elapsed.TotalSeconds -lt $timeout) {
+          try {
+            $resp = Invoke-RestMethod -Uri http://127.0.0.1:4040/api/tunnels -ErrorAction Stop
+            if ($resp.tunnels -and $resp.tunnels.Count -gt 0) {
+              $tunnels = $resp.tunnels
+              break
+            }
+          } catch {}
+          Start-Sleep -Seconds 1
+        }
+
+        if (-not $tunnels) {
+          Write-Host "ERROR: ngrok tunnels not available after $timeout seconds. Check logs."
+          # Print ngrok stdout log file if available
+          exit 1
+        }
+
+        Write-Host "ngrok public tunnels:"
+        foreach ($tun in $tunnels) {
+          Write-Host $tun.public_url
+        }
+
+        Write-Host "Keep this workflow running as long as you need the RDP tunnel. Cancel the run to close the tunnel."
+        # Keep the step alive (adjust seconds if you want shorter/longer)
+        Start-Sleep -Seconds 21600
